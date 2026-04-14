@@ -27,7 +27,10 @@ logger = logging.getLogger("hybrid-agent")
 
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
 PORT = int(os.getenv("PORT", "8000"))
+TELEGRAM_API = "https://api.telegram.org"
 
 GEMINI_MODEL = "gemini-2.5-flash"
 GEMINI_URL = (
@@ -223,8 +226,62 @@ async def health():
         "status": "ok",
         "google_key": bool(GOOGLE_API_KEY),
         "openrouter_key": bool(OPENROUTER_API_KEY),
+        "telegram_bot": bool(TELEGRAM_BOT_TOKEN),
         "judge_models": JUDGE_MODELS,
     }
+
+
+# ---------------------------------------------------------------------------
+# Telegram integration
+# ---------------------------------------------------------------------------
+async def tg_send(http: httpx.AsyncClient, chat_id: int, text: str):
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    url = f"{TELEGRAM_API}/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    for i in range(0, len(text), 4000):
+        chunk = text[i:i + 4000]
+        try:
+            await http.post(url, json={"chat_id": chat_id, "text": chunk})
+        except Exception as e:
+            logger.error("Telegram send failed: %s", e)
+
+
+@app.post("/telegram/webhook")
+async def telegram_webhook(update: dict):
+    http = app.state.http
+    msg = update.get("message") or update.get("edited_message") or {}
+    chat = msg.get("chat") or {}
+    chat_id = chat.get("id")
+    text = (msg.get("text") or "").strip()
+
+    if not chat_id or not text:
+        return {"ok": True}
+
+    if text.startswith("/start"):
+        await tg_send(http, chat_id,
+                      "Вітаю! Я — Hybrid Router Agent (Трикутник)\n"
+                      "Надішли запитання — я класифікую його (CODE/STRATEGY/DATA/LOGIC) "
+                      "і проведу через 3 стадії: Creator → Critic → Expert Judge.")
+        return {"ok": True}
+
+    await tg_send(http, chat_id, "⏳ Обробляю… (це займає 30–90 сек)")
+
+    try:
+        category = await classify(http, text)
+        draft, critique, final, judge_model, timings = await run_triangle(
+            http, text, category
+        )
+        header = (f"✅ Категорія: {category}\n"
+                  f"🧑‍⚖️ Judge: {judge_model}\n"
+                  f"⏱ {timings}\n\n")
+        await tg_send(http, chat_id, header + final)
+    except HTTPException as e:
+        await tg_send(http, chat_id, f"❌ Помилка: {e.detail}")
+    except Exception as e:
+        logger.exception("Telegram pipeline failed")
+        await tg_send(http, chat_id, f"❌ Внутрішня помилка: {e}")
+
+    return {"ok": True}
 
 
 @app.post("/classify")
